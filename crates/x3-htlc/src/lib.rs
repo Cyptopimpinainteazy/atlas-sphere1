@@ -228,6 +228,64 @@ impl<AccountId: Clone> HtlcProof<AccountId> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_verify_preimage() {
+        let pre = b"secret-1".to_vec();
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&pre);
+        let secret_hash = H256::from_slice(&hasher.finalize());
+
+        let proof = HtlcProof {
+            htlc_id: HtlcId::new(1),
+            from_chain: 1,
+            to_chain: 2,
+            recipient: "bob".to_string(),
+            amount: 100u128,
+            preimage: pre.clone(),
+            secret_hash,
+            proved_at: 123u32,
+            proof_hash: H256::zero(),
+        };
+
+        assert!(proof.verify_preimage());
+        let computed = proof.compute_proof_hash();
+        assert_ne!(computed, H256::zero());
+    }
+
+    #[test]
+    fn test_htlc_state_claim_refund() {
+        let mut state = HtlcState::new(
+            HtlcId::new(10),
+            "alice".to_string(),
+            "bob".to_string(),
+            H256::zero(),
+            100u128,
+            100u32,
+            1u32,
+        );
+
+        assert!(state.is_claimable());
+        state.mark_claimed("bob".to_string(), 2u32);
+        assert_eq!(state.status, HtlcStatus::Claimed);
+        let mut state2 = HtlcState::new(
+            HtlcId::new(11),
+            "alice".to_string(),
+            "bob".to_string(),
+            H256::zero(),
+            50u128,
+            100u32,
+            1u32,
+        );
+        state2.mark_refunded();
+        assert_eq!(state2.status, HtlcStatus::Refunded);
+    }
+}
+
 /// HTLC Claim Result
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug, Encode, Decode, TypeInfo)]
