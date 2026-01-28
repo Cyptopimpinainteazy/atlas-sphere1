@@ -19,7 +19,7 @@ resolver = "2"
 [workspace.metadata.x3]
 # X3 language configuration for different build targets
 std-features = ["std", "internment/intern", "rustc-hash/std"]
-native-only = ["x3-lang/crates/x3-ast", "x3-lang/crates/x3-common", "x3-lang/crates/x3-lexer", "x3-lang/crates/x3-tools", "x3-lang/vm", "x3-lang/compiler"]
+native-only = ["crates/x3-ast", "crates/x3-common", "crates/x3-lexer", "crates/x3-tools", "crates/x3-vm", "crates/x3-compiler"]
 
 [workspace.metadata.coverage]
 runtime = 95
@@ -57,14 +57,11 @@ sp-version = { git = "https://github.com/paritytech/polkadot-sdk", branch = "sta
 sp-weights = { git = "https://github.com/paritytech/polkadot-sdk", branch = "stable2412" }
 
 # WASM-friendly dependency overrides for polkadot-sdk branch
-[patch."https://github.com/paritytech/polkadot-sdk"]
-environmental = { path = "patches/environmental" }
+# environmental = { path = "patches/environmental" }
 
 [patch.crates-io]
 # WASM-friendly overrides for registry crates
-environmental = { path = "patches/environmental" }
 errno = { path = "patches/errno" }
-getrandom = { path = "patches/getrandom03" }
 
 [workspace.package]
 version = "0.1.0"

@@ -66,6 +66,7 @@ Self-destruct flows follow the same pattern: canonical balances are reconciled t
 - Provide browser-side scripts or wallet connectors that:
   - Fetch Atlas Kernel asset metadata for display.
   - Warn users when a transaction requires Comit finalization to settle (future enhancement).
+- Ensure MetaMask extension is installed and active in the browser for seamless integration.
 
 ---
 

@@ -1,6 +1,6 @@
 import { ethers } from 'ethers';
 import { ApiPromise, WsProvider } from '@polkadot/api';
-import x3vmConfig from '../config/x3vm-config';
+const x3vmConfig = { wsUrl: process.env.X3VM_WS_URL || 'ws://127.0.0.1:9944' }; // fallback config (tests can override via env)
 import axios from 'axios';
 
 // Simple HTLC relayer: listens for claim events on EVM and X3VM and forwards preimages
@@ -28,8 +28,14 @@ export class HtlcRelayer {
     this.evmContract.on('Claimed', async (id: string, claimer: string, preimage: string, event: any) => {
       try {
         console.log('[htlc-relayer] EVM Claimed', id, claimer);
-        const txHash = event?.transactionHash || '';
+        let txHash = event?.transactionHash || '';
         const blockNumber = event?.blockNumber || 0;
+        if (!txHash) {
+          // Try to resolve the tx hash from the log (some providers omit it)
+          txHash = await this.resolveTxHashFromEvent(event)
+            .catch((e: any) => { console.warn('[htlc-relayer] failed to resolve txHash from event', e?.message || e); return ''; });
+          if (txHash) console.log('[htlc-relayer] resolved txHash from logs', txHash);
+        }
         await callback(id, preimage, txHash, blockNumber);
       } catch (err) {
         console.error('error in EVM claim callback', err);
@@ -64,6 +70,28 @@ export class HtlcRelayer {
     return receipt.transactionHash;
   }
 
+  // Try to resolve a transaction hash that produced a particular event log
+  async resolveTxHashFromEvent(event: any): Promise<string> {
+    try {
+      if (event?.transactionHash) return event.transactionHash;
+      if (!this.evmContract) throw new Error('evmContract not initialized');
+      const iface = (this.evmContract as any).interface;
+      const topic = iface.getEventTopic('Claimed');
+      const blockNumber = event?.blockNumber;
+      if (!blockNumber) throw new Error('event has no blockNumber');
+      // query logs for that block containing the Claimed topic
+      const fromBlock = blockNumber;
+      const toBlock = blockNumber;
+      const logs = await this.evmProvider.getLogs({ address: this.evmAddress, topics: [topic], fromBlock, toBlock });
+      if (!logs || logs.length === 0) throw new Error('no logs found');
+      // return the first matching tx hash
+      return logs[0].transactionHash || '';
+    } catch (err: any) {
+      console.warn('[htlc-relayer] resolveTxHashFromEvent failed', err?.message || err);
+      return '';
+    }
+  }
+
   // Submit claim to X3VM via system.remark or via pallet call (prefers pallet)
   async submitX3vmClaim(signerSuri: string, pallet: string, method: string, payload: any): Promise<string> {
     if (!this.api) throw new Error('X3 API not initialized');
@@ -88,8 +116,8 @@ export class HtlcRelayer {
           }
         }).catch((err: any) => reject(err));
       });
-    } catch (err) {
-      console.error('[htlc-relayer] submitX3vmClaim failed', err.message || err);
+    } catch (err: any) {
+      console.error('[htlc-relayer] submitX3vmClaim failed', err?.message || err);
       throw err;
     }
   }

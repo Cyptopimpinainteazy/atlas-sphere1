@@ -90,10 +90,27 @@ pub struct HostFunctionRegistry {
     bridge_states: Arc<RwLock<HashMap<[u8; 32], u8>>>,
     /// Canonical bridge roots committed
     bridge_roots: Arc<RwLock<Vec<[u8; 32]>>>,
+    /// HTLC store: id -> HTLC entry
+    pub htlc_store: Arc<RwLock<HashMap<u64, HtlcEntry>>>,
+    /// Simple in-memory KV store to simulate contract storage for tests
+    pub kv_store: Arc<RwLock<HashMap<[u8; 32], Vec<u8>>>>,
 }
 
-/// Host function signature
-pub type HostFn = fn(&mut X3Context, &[u64]) -> Result<u64>;
+/// In-memory HTLC entry used by host functions (test/runtime simulation)
+#[derive(Clone, Debug)]
+pub struct HtlcEntry {
+    pub id: u64,
+    pub initiator: [u8; 32],
+    pub recipient: [u8; 32],
+    pub secret_hash: [u8; 32],
+    pub amount: u128,
+    pub timelock: u64,
+    pub claimed: bool,
+    pub claimed_by: Option<[u8; 32]>,
+}
+
+/// Host function signature - use boxed dyn so closures capturing env can be stored
+pub type HostFn = Box<dyn Fn(&mut X3Context, &[u64]) -> Result<u64> + Send + Sync>;
 
 /// Proof verifier trait
 pub trait ProofVerifier: Send + Sync {
@@ -121,6 +138,8 @@ impl HostFunctionRegistry {
             bridge_receipts: Arc::new(RwLock::new(HashMap::new())),
             bridge_states: Arc::new(RwLock::new(HashMap::new())),
             bridge_roots: Arc::new(RwLock::new(Vec::new())),
+            htlc_store: Arc::new(RwLock::new(HashMap::new())),
+            kv_store: Arc::new(RwLock::new(HashMap::new())),
         };
         
         registry.register_core_functions();
@@ -137,6 +156,9 @@ impl HostFunctionRegistry {
     
     pub fn with_wasm_memory(mut self, memory: Arc<dyn WasmMemory>) -> Self {
         self.wasm_memory = Some(memory);
+        // Re-register to ensure closures capture the configured memory
+        self.register_core_functions();
+        self.register_bridge_functions();
         self
     }
     
@@ -177,30 +199,66 @@ impl HostFunctionRegistry {
         // Gas cost for core operations
         const CORE_GAS: u64 = 100;
 
-        self.functions.insert("host_get_chain_id".into(), |ctx, _args| {
+        self.functions.insert("host_get_chain_id".into(), Box::new(|ctx, _args| {
             ctx.consume_gas(CORE_GAS)?;
             Ok(ctx.chain_id as u64)
-        });
+        }));
 
-        self.functions.insert("host_get_block_height".into(), |ctx, _args| {
+        self.functions.insert("host_get_block_height".into(), Box::new(|ctx, _args| {
             ctx.consume_gas(CORE_GAS)?;
             Ok(ctx.block_height)
-        });
+        }));
 
-        self.functions.insert("caller_address".into(), |ctx, _args| {
+        self.functions.insert("caller_address".into(), Box::new(|ctx, _args| {
             ctx.consume_gas(CORE_GAS)?;
             // Return first 8 bytes as u64 (simplified for MVP)
             let mut bytes = [0u8; 8];
             bytes.copy_from_slice(&ctx.caller[0..8]);
             Ok(u64::from_le_bytes(bytes))
-        });
+        }));
 
-        self.functions.insert("self_address".into(), |ctx, _args| {
+        self.functions.insert("self_address".into(), Box::new(|ctx, _args| {
             ctx.consume_gas(CORE_GAS)?;
             let mut bytes = [0u8; 8];
             bytes.copy_from_slice(&ctx.self_addr[0..8]);
             Ok(u64::from_le_bytes(bytes))
-        });
+        }));
+
+        // host_sha256(ptr: u64, len: u64, out_ptr: u64) -> i64 (1=ok,0=fail)
+        let wasm_mem = self.wasm_memory.clone();
+        self.functions.insert("host_sha256".into(), Box::new(move |ctx, args| {
+            ctx.consume_gas(CORE_GAS * 10)?; // base cost for hashing
+
+            if args.len() < 3 {
+                return Err(anyhow!("host_sha256 requires 3 args: ptr, len, out_ptr"));
+            }
+
+            let ptr = args[0] as u32;
+            let len = args[1] as u32;
+            let out_ptr = args[2] as u32;
+
+            // Read input from WASM memory
+            let mem = match &wasm_mem {
+                Some(m) => m,
+                None => return Err(anyhow!("WASM memory not configured for host_sha256")),
+            };
+
+            if len == 0 || len > 65536 {
+                return Ok(0);
+            }
+
+            let data = mem.read(ptr, len)?;
+
+            use sha2::{Sha256, Digest};
+            let mut hasher = Sha256::new();
+            hasher.update(&data);
+            let digest = hasher.finalize();
+
+            // Write digest (32 bytes) back to WASM memory at out_ptr
+            mem.write(out_ptr, &digest)?;
+
+            Ok(1)
+        }));
     }
 
     fn register_bridge_functions(&mut self) {
@@ -211,18 +269,18 @@ impl HostFunctionRegistry {
         let bridge_states = Arc::clone(&self.bridge_states);
         let bridge_roots = Arc::clone(&self.bridge_roots);
 
-        self.functions.insert("host_send_message".into(), |ctx, args| {
+self.functions.insert("host_send_message".into(), Box::new(|ctx, args| {
             ctx.consume_gas(BRIDGE_GAS)?;
             
             if args.len() < 4 {
                 return Err(anyhow!("host_send_message requires 4 args: dst_chain, payload_ptr, payload_len, gas_limit"));
             }
-            
+
             let dst_chain = args[0] as u32;
             let payload_ptr = args[1] as u32;
             let payload_len = args[2] as u32;
             let gas_limit = args[3];
-            
+
             // Read payload from context's pending memory buffer if available
             // In production, this reads from WASM linear memory via the executor
             let payload = if payload_len > 0 && payload_len <= 16384 {
@@ -236,7 +294,7 @@ impl HostFunctionRegistry {
             } else {
                 Vec::new()
             };
-            
+
             let msg = BridgeMessage {
                 src_chain: ctx.chain_id,
                 dst_chain,
@@ -252,70 +310,185 @@ impl HostFunctionRegistry {
             let mut bytes = [0u8; 8];
             bytes.copy_from_slice(&msg_id[0..8]);
             Ok(u64::from_le_bytes(bytes))
-        });
+        }));
 
-        self.functions.insert("host_verify_proof".into(), |ctx, args| {
-            ctx.consume_gas(BRIDGE_GAS * 10)?; // ZK verification is expensive
-            
-            if args.len() < 2 {
-                return Err(anyhow!("host_verify_proof requires 2 args: proof_ptr, proof_len"));
+        // Register HTLC host functions
+        let htlc_store = Arc::clone(&self.htlc_store);
+        let wasm_mem_clone = self.wasm_memory.clone();
+        self.functions.insert("host_htlc_create".into(), Box::new(move |_ctx, args| {
+            // args: id, secret_ptr, secret_len, amount_low, timelock
+            if args.len() < 5 {
+                return Err(anyhow!("host_htlc_create requires args: id, secret_ptr, secret_len, amount_lo, timelock"));
             }
-            
-            let proof_ptr = args[0] as u32;
-            let proof_len = args[1] as u32;
-            
-            // Validate proof length
-            if proof_len == 0 || proof_len > 65536 {
-                return Ok(0); // Invalid proof
-            }
-            
-            // In production, read proof from WASM memory and verify with ZK verifier
-            // For now, accept proofs where the first arg (ptr) indicates a valid proof marker
-            // Real impl: let proof = registry.read_wasm_memory(proof_ptr, proof_len)?;
-            //            let valid = registry.proof_verifier.verify(&proof);
-            
-            // Mock verification: accept if proof_ptr has marker byte pattern
-            let valid = proof_ptr > 0 && (proof_ptr & 0xFF) == 0x01;
-            
-            Ok(if valid { 1 } else { 0 })
-        });
+            let id = args[0];
+            let secret_ptr = args[1] as u32;
+            let secret_len = args[2] as u32;
+            let amount = args[3];
+            let timelock = args[4];
 
-        self.functions.insert("host_execute_bridge_intent".into(), |ctx, args| {
-            ctx.consume_gas(BRIDGE_GAS * 5)?;
-            
-            if args.len() < 2 {
-                return Err(anyhow!("host_execute_bridge_intent requires 2 args: intent_ptr, intent_len"));
+            let mem = match &wasm_mem_clone {
+                Some(m) => m,
+                None => return Err(anyhow!("WASM memory not available for host_htlc_create")),
+            };
+
+            if secret_len != 32 {
+                return Err(anyhow!("secret_len must be 32"));
             }
-            
-            let intent_ptr = args[0] as u32;
-            let intent_len = args[1] as u32;
-            
-            // Validate intent size
-            if intent_len == 0 || intent_len > 16384 {
-                return Err(anyhow!("Invalid intent size: {}", intent_len));
+
+            let secret = mem.read(secret_ptr, secret_len)?;
+            let mut sh = [0u8; 32];
+            sh.copy_from_slice(&secret[..32]);
+
+            let entry = HtlcEntry {
+                id: id as u64,
+                initiator: [0u8; 32],
+                recipient: [0u8; 32],
+                secret_hash: sh,
+                amount: amount as u128,
+                timelock: timelock as u64,
+                claimed: false,
+                claimed_by: None,
+            };
+
+            if let Ok(mut m) = htlc_store.write() {
+                m.insert(id as u64, entry);
             }
-            
-            // In production: deserialize Intent from WASM memory
-            // let intent_bytes = registry.read_wasm_memory(intent_ptr, intent_len)?;
-            // let intent: BridgeIntent = Decode::decode(&mut &intent_bytes[..])?;
-            
-            // Execute the intent and generate a receipt
-            // For now, create a mock receipt ID based on intent params
+
+            Ok(1)
+        }));
+
+        let htlc_store2 = Arc::clone(&self.htlc_store);
+        let wasm_mem_clone2 = self.wasm_memory.clone();
+        self.functions.insert("host_htlc_claim".into(), Box::new(move |ctx, args| {
+            // args: id, preimage_ptr, preimage_len
+            ctx.consume_gas(BRIDGE_GAS)?; // reuse bridge gas for now
+
+            if args.len() < 3 {
+                return Err(anyhow!("host_htlc_claim requires args: id, preimage_ptr, preimage_len"));
+            }
+
+            let id = args[0] as u64;
+            let pre_ptr = args[1] as u32;
+            let pre_len = args[2] as u32;
+
+            let mem = match &wasm_mem_clone2 {
+                Some(m) => m,
+                None => return Err(anyhow!("WASM memory not available for host_htlc_claim")),
+            };
+
+            if pre_len == 0 || pre_len > 1024 {
+                return Ok(0);
+            }
+
+            let pre = mem.read(pre_ptr, pre_len)?;
+
             use sha2::{Sha256, Digest};
             let mut hasher = Sha256::new();
-            hasher.update(&intent_ptr.to_le_bytes());
-            hasher.update(&intent_len.to_le_bytes());
-            hasher.update(&ctx.caller);
-            let receipt_hash = hasher.finalize();
-            
-            // Return receipt pointer (first 8 bytes as u64)
-            let mut receipt_id = [0u8; 8];
-            receipt_id.copy_from_slice(&receipt_hash[0..8]);
-            Ok(u64::from_le_bytes(receipt_id))
-        });
+            hasher.update(&pre);
+            let digest = hasher.finalize();
+
+            if let Ok(mut m) = htlc_store2.write() {
+                if let Some(entry) = m.get_mut(&id) {
+                    if entry.claimed {
+                        return Ok(2); // already claimed
+                    }
+                    if entry.secret_hash[..] == digest[..] {
+                        entry.claimed = true;
+                        entry.claimed_by = Some(ctx.caller);
+                        // Emit log
+                        ctx.emit_log("HTLCClaimed".into(), id.to_le_bytes().to_vec());
+                        return Ok(1);
+                    } else {
+                        return Ok(3); // invalid preimage
+                    }
+                }
+            }
+
+            Ok(0)
+        }));
+
+        // storage_read(key_ptr:u64, key_len:u64, out_ptr:u64) -> len_written (u64) or 0
+        let kv_store_read = Arc::clone(&self.kv_store);
+        let wasm_mem_for_read = self.wasm_memory.clone();
+        self.functions.insert("storage_read".into(), Box::new(move |_ctx, args| {
+            if args.len() < 3 {
+                return Err(anyhow!("storage_read requires args: key_ptr, key_len, out_ptr"));
+            }
+            let key_ptr = args[0] as u32;
+            let key_len = args[1] as u32;
+            let out_ptr = args[2] as u32;
+
+            let mem = match &wasm_mem_for_read {
+                Some(m) => m,
+                None => return Err(anyhow!("WASM memory not available for storage_read")),
+            };
+
+            if key_len != 32 {
+                return Ok(0);
+            }
+
+            let key_bytes = mem.read(key_ptr, key_len)?;
+            let mut key = [0u8; 32]; key.copy_from_slice(&key_bytes[..32]);
+
+            if let Ok(store) = kv_store_read.read() {
+                if let Some(val) = store.get(&key) {
+                    if val.len() > 1024 {
+                        return Err(anyhow!("Value too large"));
+                    }
+                    mem.write(out_ptr, val)?;
+                    return Ok(val.len() as u64);
+                }
+            }
+            Ok(0)
+        }));
+
+        // host_memcmp(a_ptr:u64, b_ptr:u64, len:u64) -> 0 if equal, 1 otherwise
+        let wasm_mem_for_memcmp = self.wasm_memory.clone();
+        self.functions.insert("host_memcmp".into(), Box::new(move |_ctx, args| {
+            if args.len() < 3 {
+                return Err(anyhow!("host_memcmp requires args: a_ptr, b_ptr, len"));
+            }
+            let a_ptr = args[0] as u32;
+            let b_ptr = args[1] as u32;
+            let len = args[2] as u32;
+
+            let mem = match &wasm_mem_for_memcmp {
+                Some(m) => m,
+                None => return Err(anyhow!("WASM memory not available for host_memcmp")),
+            };
+
+            if len == 0 || len > 65536 {
+                return Ok(1);
+            }
+
+            let a = mem.read(a_ptr, len)?;
+            let b = mem.read(b_ptr, len)?;
+            if a == b { Ok(0) } else { Ok(1) }
+        }));
+
+        // host_storage_mark_claimed(id:u64) -> 1 on success, 2 already claimed, 0 not found
+        let htlc_store_mark = Arc::clone(&self.htlc_store);
+        self.functions.insert("host_storage_mark_claimed".into(), Box::new(move |ctx, args| {
+            if args.is_empty() {
+                return Err(anyhow!("host_storage_mark_claimed requires id arg"));
+            }
+            let id = args[0] as u64;
+            if let Ok(mut m) = htlc_store_mark.write() {
+                if let Some(entry) = m.get_mut(&id) {
+                    if entry.claimed {
+                        return Ok(2);
+                    }
+                    entry.claimed = true;
+                    entry.claimed_by = Some(ctx.caller);
+                    ctx.emit_log("HTLCClaimedByWASM".into(), id.to_le_bytes().to_vec());
+                    return Ok(1);
+                }
+            }
+            Ok(0)
+        }));
 
         let roots_clone = Arc::clone(&bridge_roots);
-        self.functions.insert("host_commit_bridge_root".into(), move |ctx, args| {
+        self.functions.insert("host_commit_bridge_root".into(), Box::new(move |ctx, args| {
             ctx.consume_gas(BRIDGE_GAS)?;
             
             if args.is_empty() {
@@ -342,10 +515,10 @@ impl HostFunctionRegistry {
             );
             
             Ok(1) // Success
-        });
+        }));
 
         let receipts_clone = Arc::clone(&bridge_receipts);
-        self.functions.insert("host_resolve_bridge_receipt".into(), move |ctx, args| {
+        self.functions.insert("host_resolve_bridge_receipt".into(), Box::new(move |ctx, args| {
             ctx.consume_gas(BRIDGE_GAS)?;
             
             if args.is_empty() {
@@ -369,10 +542,10 @@ impl HostFunctionRegistry {
             }
             
             Ok(0) // None - no receipt found
-        });
+        }));
 
         let states_clone = Arc::clone(&bridge_states);
-        self.functions.insert("host_get_bridge_state".into(), move |ctx, args| {
+        self.functions.insert("host_get_bridge_state".into(), Box::new(move |ctx, args| {
             ctx.consume_gas(BRIDGE_GAS / 2)?;
             
             if args.is_empty() {
@@ -394,7 +567,7 @@ impl HostFunctionRegistry {
             // Return BridgeState enum as u64
             // 0 = Pending, 1 = Executed, 2 = Failed, 3 = Finalized
             Ok(0) // Pending (default for unknown messages)
-        });
+        }));
     }
 
     /// Call a host function by name
@@ -428,7 +601,9 @@ impl EvmHostFunctions {
     pub fn register(registry: &mut HostFunctionRegistry) {
         const EVM_TOKEN_GAS: u64 = 3000;
 
-        registry.functions.insert("evm_balance_of".into(), |ctx, args| {
+        let token_balances1 = Arc::clone(&registry.token_balances);
+
+        registry.functions.insert("evm_balance_of".into(), Box::new(move |ctx, args| {
             ctx.consume_gas(EVM_TOKEN_GAS)?;
             
             if args.len() < 2 {
@@ -438,22 +613,24 @@ impl EvmHostFunctions {
             let token_addr = args[0];
             let owner = args[1];
             
-            // Construct storage key: EVM prefix (0x00) + token_addr + owner
-            let mut key = [0u8; 32];
-            key[0] = 0x00; // EVM namespace
-            key[1..9].copy_from_slice(&token_addr.to_le_bytes());
-            key[9..17].copy_from_slice(&owner.to_le_bytes());
+            // Construct token key: ([u8;32] token_id, [u8;32] owner)
+            let mut token_key = [0u8; 32];
+            token_key[0] = 0x00; // EVM namespace
+            token_key[1..9].copy_from_slice(&token_addr.to_le_bytes());
+            let mut owner_key = [0u8; 32];
+            owner_key[0..8].copy_from_slice(&owner.to_le_bytes());
             
             // Query from token_balances storage
-            if let Some(balance) = ctx.token_balances.get(&key) {
-                Ok(*balance as u64)
-            } else {
-                // Return 0 for unknown balances
-                Ok(0)
+            if let Ok(tb) = token_balances1.read() {
+                if let Some(balance) = tb.get(&(token_key, owner_key)) {
+                    return Ok(*balance as u64);
+                }
             }
-        });
+            // Return 0 for unknown balances
+            Ok(0)
+        }));
 
-        registry.functions.insert("evm_transfer".into(), |ctx, args| {
+        registry.functions.insert("evm_transfer".into(), Box::new(|ctx, args| {
             ctx.consume_gas(EVM_TOKEN_GAS * 2)?;
             
             if args.len() < 3 {
@@ -479,9 +656,9 @@ impl EvmHostFunctions {
             );
             
             Ok(1) // Success
-        });
+        }));
 
-        registry.functions.insert("evm_approve".into(), |ctx, args| {
+        registry.functions.insert("evm_approve".into(), Box::new(|ctx, args| {
             ctx.consume_gas(EVM_TOKEN_GAS)?;
             
             if args.len() < 3 {
@@ -494,9 +671,10 @@ impl EvmHostFunctions {
             );
             
             Ok(1) // Success
-        });
+        }));
 
-        registry.functions.insert("evm_allowance".into(), |ctx, args| {
+        let token_balances2 = Arc::clone(&registry.token_balances);
+        registry.functions.insert("evm_allowance".into(), Box::new(move |ctx, args| {
             ctx.consume_gas(EVM_TOKEN_GAS)?;
             
             if args.len() < 3 {
@@ -507,27 +685,29 @@ impl EvmHostFunctions {
             let owner = args[1];
             let spender = args[2];
             
-            // Construct allowance storage key: EVM prefix (0x01) + token + owner + spender
-            let mut key = [0u8; 32];
-            key[0] = 0x01; // EVM allowance namespace
-            key[1..9].copy_from_slice(&token_addr.to_le_bytes());
-            // Hash owner+spender to fit in remaining bytes
+            // Construct token key (first element)
+            let mut token_key = [0u8; 32];
+            token_key[0] = 0x01; // EVM allowance namespace
+            token_key[1..9].copy_from_slice(&token_addr.to_le_bytes());
+            // Hash owner+spender to create secondary key
             use sha2::{Sha256, Digest};
             let mut hasher = Sha256::new();
             hasher.update(&owner.to_le_bytes());
             hasher.update(&spender.to_le_bytes());
             let hash = hasher.finalize();
-            key[9..32].copy_from_slice(&hash[0..23]);
+            let mut owner_sp_key = [0u8; 32];
+            owner_sp_key[0..23].copy_from_slice(&hash[0..23]);
             
             // Query from token_balances (used for allowances too)
-            if let Some(allowance) = ctx.token_balances.get(&key) {
-                Ok(*allowance as u64)
-            } else {
-                Ok(0) // No allowance set
+            if let Ok(tb) = token_balances2.read() {
+                if let Some(allowance) = tb.get(&(token_key, owner_sp_key)) {
+                    return Ok(*allowance as u64);
+                }
             }
-        });
+            Ok(0) // No allowance set
+        }));
 
-        registry.functions.insert("evm_transfer_from".into(), |ctx, args| {
+        registry.functions.insert("evm_transfer_from".into(), Box::new(|ctx, args| {
             ctx.consume_gas(EVM_TOKEN_GAS * 2)?;
             
             if args.len() < 4 {
@@ -540,7 +720,7 @@ impl EvmHostFunctions {
             );
             
             Ok(1) // Success
-        });
+        }));
     }
 }
 
@@ -551,7 +731,8 @@ impl SvmHostFunctions {
     pub fn register(registry: &mut HostFunctionRegistry) {
         const SVM_TOKEN_GAS: u64 = 2500;
 
-        registry.functions.insert("svm_balance_of".into(), |ctx, args| {
+        let token_balances_svm = Arc::clone(&registry.token_balances);
+        registry.functions.insert("svm_balance_of".into(), Box::new(move |ctx, args| {
             ctx.consume_gas(SVM_TOKEN_GAS)?;
             
             if args.len() < 2 {
@@ -561,22 +742,23 @@ impl SvmHostFunctions {
             let mint = args[0];
             let owner = args[1];
             
-            // Construct storage key: SVM prefix (0x80) + mint + owner
-            let mut key = [0u8; 32];
-            key[0] = 0x80; // SVM namespace (128+)
-            key[1..9].copy_from_slice(&mint.to_le_bytes());
-            key[9..17].copy_from_slice(&owner.to_le_bytes());
+            // Construct token key tuple for SVM: (token, owner)
+            let mut token_key = [0u8; 32];
+            token_key[0] = 0x80; // SVM namespace (128+)
+            token_key[1..9].copy_from_slice(&mint.to_le_bytes());
+            let mut owner_key = [0u8; 32];
+            owner_key[0..8].copy_from_slice(&owner.to_le_bytes());
             
             // Query from token_balances storage
-            if let Some(balance) = ctx.token_balances.get(&key) {
-                Ok(*balance as u64)
-            } else {
-                // Return 0 for unknown balances
-                Ok(0)
+            if let Ok(tb) = token_balances_svm.read() {
+                if let Some(balance) = tb.get(&(token_key, owner_key)) {
+                    return Ok(*balance as u64);
+                }
             }
-        });
+            Ok(0)
+        }));
 
-        registry.functions.insert("svm_transfer".into(), |ctx, args| {
+        registry.functions.insert("svm_transfer".into(), Box::new(|ctx, args| {
             ctx.consume_gas(SVM_TOKEN_GAS * 2)?;
             
             if args.len() < 3 {
@@ -603,9 +785,9 @@ impl SvmHostFunctions {
             );
             
             Ok(1) // Success
-        });
+        }));
 
-        registry.functions.insert("svm_approve".into(), |ctx, args| {
+        registry.functions.insert("svm_approve".into(), Box::new(|ctx, args| {
             ctx.consume_gas(SVM_TOKEN_GAS)?;
             
             if args.len() < 3 {
@@ -618,9 +800,10 @@ impl SvmHostFunctions {
             );
             
             Ok(1) // Success
-        });
+        }));
 
-        registry.functions.insert("svm_allowance".into(), |ctx, args| {
+        let token_balances_svm2 = Arc::clone(&registry.token_balances);
+        registry.functions.insert("svm_allowance".into(), Box::new(move |ctx, args| {
             ctx.consume_gas(SVM_TOKEN_GAS)?;
             
             if args.len() < 3 {
@@ -631,27 +814,29 @@ impl SvmHostFunctions {
             let owner = args[1];
             let delegate = args[2];
             
-            // Construct delegation storage key: SVM prefix (0x81) + mint + owner + delegate
-            let mut key = [0u8; 32];
-            key[0] = 0x81; // SVM delegation namespace
-            key[1..9].copy_from_slice(&mint.to_le_bytes());
+            // Construct token key tuple for SVM delegation: (token_key, owner_delegate_hash)
+            let mut token_key = [0u8; 32];
+            token_key[0] = 0x81; // SVM delegation namespace
+            token_key[1..9].copy_from_slice(&mint.to_le_bytes());
             // Hash owner+delegate to fit in remaining bytes
             use sha2::{Sha256, Digest};
             let mut hasher = Sha256::new();
             hasher.update(&owner.to_le_bytes());
             hasher.update(&delegate.to_le_bytes());
             let hash = hasher.finalize();
-            key[9..32].copy_from_slice(&hash[0..23]);
+            let mut owner_delegate = [0u8; 32];
+            owner_delegate[0..23].copy_from_slice(&hash[0..23]);
             
             // Query from token_balances (used for delegations too)
-            if let Some(delegation) = ctx.token_balances.get(&key) {
-                Ok(*delegation as u64)
-            } else {
-                Ok(0) // No delegation set
+            if let Ok(tb) = token_balances_svm2.read() {
+                if let Some(delegation) = tb.get(&(token_key, owner_delegate)) {
+                    return Ok(*delegation as u64);
+                }
             }
-        });
+            Ok(0) // No delegation set
+        }));
 
-        registry.functions.insert("svm_transfer_from".into(), |ctx, args| {
+        registry.functions.insert("svm_transfer_from".into(), Box::new(|ctx, args| {
             ctx.consume_gas(SVM_TOKEN_GAS * 2)?;
             
             if args.len() < 4 {
@@ -664,7 +849,7 @@ impl SvmHostFunctions {
             );
             
             Ok(1) // Success
-        });
+        }));
     }
 }
 
@@ -675,7 +860,7 @@ impl DexHostFunctions {
     pub fn register(registry: &mut HostFunctionRegistry) {
         const DEX_GAS: u64 = 10000;
 
-        registry.functions.insert("host_quote_swap".into(), |ctx, args| {
+        registry.functions.insert("host_quote_swap".into(), Box::new(|ctx, args| {
             ctx.consume_gas(DEX_GAS)?;
             
             if args.len() < 2 {
@@ -689,9 +874,9 @@ impl DexHostFunctions {
             let amt_out = amt_in - fee;
             
             Ok(amt_out as u64)
-        });
+        }));
 
-        registry.functions.insert("host_swap_exact_in".into(), |ctx, args| {
+        registry.functions.insert("host_swap_exact_in".into(), Box::new(|ctx, args| {
             ctx.consume_gas(DEX_GAS * 5)?;
             
             if args.len() < 4 {
@@ -715,9 +900,9 @@ impl DexHostFunctions {
             );
             
             Ok(amt_out as u64)
-        });
+        }));
 
-        registry.functions.insert("host_find_routes".into(), |ctx, args| {
+        registry.functions.insert("host_find_routes".into(), Box::new(|ctx, args| {
             ctx.consume_gas(DEX_GAS * 2)?;
             
             if args.len() < 3 {
@@ -754,7 +939,7 @@ impl DexHostFunctions {
             );
             
             Ok(encoded)
-        });
+        }));
     }
 }
 
@@ -781,6 +966,69 @@ mod tests {
         assert!(registry.has_function("self_address"));
         assert!(registry.has_function("host_send_message"));
         assert!(registry.has_function("host_verify_proof"));
+        assert!(registry.has_function("host_sha256"));
+    }
+
+    #[test]
+    fn test_host_sha256_memory_roundtrip() {
+        // Prepare WASM memory with input data
+        let mut mem = InMemoryWasm::new(1024);
+        let input = b"hello-host-sha";
+        let ptr: u32 = 100;
+        let out_ptr: u32 = 200;
+        mem.write(ptr, input).unwrap();
+
+        // Create registry with memory
+        let registry = HostFunctionRegistry::new().with_wasm_memory(Arc::new(mem));
+        let caller = [2u8; 32];
+        let mut ctx = X3Context::new(caller, 100000);
+
+        let res = registry.call("host_sha256", &mut ctx, &[ptr as u64, input.len() as u64, out_ptr as u64]).unwrap();
+        assert_eq!(res, 1);
+
+        // Read back digest from memory
+        let digest = registry.read_wasm_memory(out_ptr, 32).unwrap();
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(input);
+        let expected = hasher.finalize();
+        assert_eq!(digest, expected.to_vec());
+    }
+
+    #[test]
+    fn test_htlc_create_and_claim() {
+        // Set up memory: secret hash + preimage
+        let mut mem = InMemoryWasm::new(2048);
+        let preimage = b"super-secret-pre".to_vec();
+        let pre_ptr: u32 = 256;
+        let pre_len: u32 = preimage.len() as u32;
+        mem.write(pre_ptr, &preimage).unwrap();
+
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(&preimage);
+        let secret = hasher.finalize();
+        let secret_ptr: u32 = 512;
+        mem.write(secret_ptr, &secret).unwrap();
+
+        // Registry with memory
+        let registry = HostFunctionRegistry::new().with_wasm_memory(Arc::new(mem));
+        let caller = [9u8; 32];
+        let mut ctx = X3Context::new(caller, 100000);
+
+        // Create HTLC id=1
+        let res = registry.call("host_htlc_create", &mut ctx, &[1u64, secret_ptr as u64, 32u64, 1000u64, 999u64]).unwrap();
+        assert_eq!(res, 1);
+
+        // Try claiming with correct preimage
+        let res2 = registry.call("host_htlc_claim", &mut ctx, &[1u64, pre_ptr as u64, pre_len as u64]).unwrap();
+        assert_eq!(res2, 1);
+
+        // Check store shows claimed
+        let store = registry.htlc_store.read().unwrap();
+        let e = store.get(&1).expect("htlc exists");
+        assert!(e.claimed);
+        assert_eq!(e.claimed_by.unwrap(), caller);
     }
 
     #[test]

@@ -153,7 +153,7 @@ fn wasm_x3_claim_flow() {
             }
             let start = p + br;
             if section_id == 2 {
-                eprintln!("import section bytes: {:?}", &wasm[start..start+size]);
+                log::debug!("import section bytes: {:?}", &wasm[start..start+size]);
                 break;
             }
             p = start + size;

@@ -14,6 +14,10 @@ frame-support = { workspace = true, default-features = false }
 codec = { workspace = true, default-features = false, features = ["derive"] }
 scale-info = { workspace = true, default-features = false, features = ["derive"] }
 
+[dev-dependencies]
+# Use x3-runtime executor to integration-test WASM host imports
+x3-runtime = { path = "../x3-runtime", default-features = false }
+
 [features]
 default = ["std"]
 serde = [
