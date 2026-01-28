@@ -227,7 +227,7 @@ impl X3Executor {
 
     /// Execute a raw sequence of instructions (no local decl header)
     fn execute_instruction_sequence(&self, seq: &[u8], import_section: Option<&[u8]>, ctx: &mut X3Context, args: &[u64]) -> Result<i64> {
-        eprintln!("execute_instruction_sequence: len={} bytes={:?}", seq.len(), &seq.get(0..std::cmp::min(16, seq.len())).unwrap_or(&[]));
+        if self.enable_tracing { eprintln!("execute_instruction_sequence: len={} bytes={:?}", seq.len(), &seq.get(0..std::cmp::min(16, seq.len())).unwrap_or(&[])); }
         let mut import_names: Vec<String> = Vec::new();
         if let Some(section) = import_section {
             let (count, mut p) = self.read_leb128_u32(section)?;
@@ -392,10 +392,10 @@ impl X3Executor {
 
     fn execute_function_body(&self, body: &[u8], import_section: Option<&[u8]>, ctx: &mut X3Context, args: &[u64]) -> Result<i64> {
         // Debug: log body entrance
-        eprintln!("execute_function_body: entering body.len={} pos_bytes={:?}", body.len(), &body.get(0..std::cmp::min(16, body.len())).unwrap_or(&[]));
+        if self.enable_tracing { eprintln!("execute_function_body: entering body.len={} pos_bytes={:?}", body.len(), &body.get(0..std::cmp::min(16, body.len())).unwrap_or(&[])); }
         // Parse local decls if present. If parsing looks malformed, treat entire body as instruction sequence.
         let (local_count, mut pos) = self.read_leb128_u32(body)?;
-        eprintln!("execute_function_body: local_count={} start_pos={}", local_count, pos);
+        if self.enable_tracing { eprintln!("execute_function_body: local_count={} start_pos={}", local_count, pos); }
         // Try parsing locals safely into a temporary pointer first
         let mut tmp_pos = pos;
         let mut locals_ok = true;
@@ -410,7 +410,7 @@ impl X3Executor {
             if cnt > 1024 { locals_ok = false; break; }
         }
         if !locals_ok {
-            eprintln!("execute_function_body: malformed locals, falling back to instruction seq");
+            if self.enable_tracing { eprintln!("execute_function_body: malformed locals, falling back to instruction seq"); }
             return self.execute_instruction_sequence(body, import_section, ctx, args);
         }
         // Commit parsed position
@@ -421,27 +421,27 @@ impl X3Executor {
             let (count, mut p) = self.read_leb128_u32(section)?;
             for i in 0..count {
                 if p >= section.len() { break; }
-                let (mod_len, br) = self.read_leb128_u32(&section[p..])?; eprintln!("import[{}]: mod_len={}, br={}", i, mod_len, br); p += br;
+                let (mod_len, br) = self.read_leb128_u32(&section[p..])?; if self.enable_tracing { eprintln!("import[{}]: mod_len={}, br={}", i, mod_len, br); } p += br;
                 if p + mod_len as usize > section.len() { break; }
-                let module = std::str::from_utf8(&section[p..p + mod_len as usize]).unwrap_or("<invalid>").to_string(); eprintln!("import[{}]: module='{}'", i, module);
+                let module = std::str::from_utf8(&section[p..p + mod_len as usize]).unwrap_or("<invalid>").to_string(); if self.enable_tracing { eprintln!("import[{}]: module='{}'", i, module); }
                 p += mod_len as usize; // skip module name
                 if p >= section.len() { break; }
-                let (name_len, br2) = self.read_leb128_u32(&section[p..])?; eprintln!("import[{}]: name_len={}, br2={}", i, name_len, br2); p += br2;
+                let (name_len, br2) = self.read_leb128_u32(&section[p..])?; if self.enable_tracing { eprintln!("import[{}]: name_len={}, br2={}", i, name_len, br2); } p += br2;
                 if p + name_len as usize > section.len() { break; }
-                let name = std::str::from_utf8(&section[p..p + name_len as usize]).unwrap_or("<invalid>").to_string(); eprintln!("import[{}]: name='{}'", i, name);
+                let name = std::str::from_utf8(&section[p..p + name_len as usize]).unwrap_or("<invalid>").to_string(); if self.enable_tracing { eprintln!("import[{}]: name='{}'", i, name); }
                 p += name_len as usize;
                 if p >= section.len() { break; }
-                let kind = section[p]; eprintln!("import[{}]: kind={}", i, kind); p += 1;
+                let kind = section[p]; if self.enable_tracing { eprintln!("import[{}]: kind={}", i, kind); } p += 1;
                 // skip kind-specific payload (for funcs: typeidx)
                 if kind == 0 {
                     if p >= section.len() { break; }
-                    let (type_idx, br3) = self.read_leb128_u32(&section[p..])?; eprintln!("import[{}]: type_idx={}, br3={}", i, type_idx, br3); p += br3;
+                    let (type_idx, br3) = self.read_leb128_u32(&section[p..])?; if self.enable_tracing { eprintln!("import[{}]: type_idx={}, br3={}", i, type_idx, br3); } p += br3;
                 } else {
                     // For non-func imports, skip simplistic placeholder
                 }
                 import_names.push(name);
             }
-            eprintln!("import_count_declared={}, import_names_parsed={:?}", count, import_names);
+            if self.enable_tracing { eprintln!("import_count_declared={}, import_names_parsed={:?}", count, import_names); }
             if import_names.len() as u32 != count {
                 return Err(anyhow!(format!("Failed to parse imports: declared {}, parsed {}", count, import_names.len())));
             }
@@ -984,5 +984,27 @@ mod tests {
             let e = store.get(&7).expect("htlc exists");
             assert!(e.claimed);
         }
+    }
+
+    #[test]
+    fn test_execute_function_body_malformed_locals_fallback() {
+        let executor = X3Executor::new();
+        let mut ctx = crate::X3Context::new([0u8;32], 1000);
+        // local_count=1 but no local entries -> should fall back to instruction seq and return 1
+        let body = vec![0x01, 0x42, 0x01, 0x0b];
+        let res = executor.execute_function_body(&body, None, &mut ctx, &[]);
+        assert!(res.is_ok());
+        assert_eq!(res.unwrap(), 1);
+    }
+
+    #[test]
+    fn test_nested_if_else_parsing() {
+        let executor = X3Executor::new().with_tracing(false);
+        let mut ctx = crate::X3Context::new([0u8;32], 10000);
+        // body: 0 locals, i64.const 1, i64.eqz, if (blocktype) i64.const 99 else i64.const 77 end end
+        let body = vec![0x00, 0x42,0x01, 0x51, 0x04,0x7e, 0x42,99, 0x05, 0x42,77, 0x0b, 0x0b];
+        let res = executor.execute_function_body(&body, None, &mut ctx, &[]);
+        assert!(res.is_ok());
+        assert_eq!(res.unwrap(), 77);
     }
 }
