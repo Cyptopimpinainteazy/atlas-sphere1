@@ -10,17 +10,20 @@ describe('HTLC Automator (unit)', function () {
     const fakeRelayer: any = {
       init: sinon.fake.resolves(null),
       watchEvmClaims: sinon.fake(async (cb: any) => {
-        // simulate an EVM claim callback invocation
-        await cb('0xdeadbeef', '0x010203');
+        // simulate an EVM claim callback invocation with txHash and blockNumber
+        await cb('0xdeadbeef', '0x010203', '0xTXHASH', 100);
       }),
       watchX3vmClaims: sinon.fake.resolves(null),
-      submitX3vmClaim: sinon.fake.resolves(true),
+      submitX3vmClaim: sinon.fake.resolves('0xBLOCKHASH'),
     };
 
     // Replace relayer in automator
     const automatorModule = require('../src/htlc-automation');
     const automator = new automatorModule.HtlcAutomator();
     automator.relayer = fakeRelayer;
+    // stub waitEvmConfirmations to avoid network calls
+    automator.waitEvmConfirmations = async () => true;
+    automator.waitX3Finality = async () => true;
 
     await automator.start();
 

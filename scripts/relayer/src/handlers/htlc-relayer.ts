@@ -23,12 +23,14 @@ export class HtlcRelayer {
   }
 
   // Listen for EVM Claimed events which include preimage
-  async watchEvmClaims(callback: (id: string, preimage: string) => Promise<void>) {
+  async watchEvmClaims(callback: (id: string, preimage: string, txHash: string, blockNumber: number) => Promise<void>) {
     if (!this.evmContract) throw new Error('evmContract not initialized');
     this.evmContract.on('Claimed', async (id: string, claimer: string, preimage: string, event: any) => {
       try {
         console.log('[htlc-relayer] EVM Claimed', id, claimer);
-        await callback(id, preimage);
+        const txHash = event?.transactionHash || '';
+        const blockNumber = event?.blockNumber || 0;
+        await callback(id, preimage, txHash, blockNumber);
       } catch (err) {
         console.error('error in EVM claim callback', err);
       }
@@ -63,7 +65,7 @@ export class HtlcRelayer {
   }
 
   // Submit claim to X3VM via system.remark or via pallet call (prefers pallet)
-  async submitX3vmClaim(signerSuri: string, pallet: string, method: string, payload: any) {
+  async submitX3vmClaim(signerSuri: string, pallet: string, method: string, payload: any): Promise<string> {
     if (!this.api) throw new Error('X3 API not initialized');
     const kr = require('@polkadot/keyring').default;
     const keyring = new kr({ type: 'sr25519' });
@@ -71,16 +73,24 @@ export class HtlcRelayer {
     // call pallet.method(payload)
     try {
       const call = (this.api.tx as any)[pallet][method](...payload);
-      const unsub = await call.signAndSend(pair, (res: any) => {
-        if (res.status.isInBlock) {
-          console.log('[htlc-relayer] X3 claim included in block', res.status.asInBlock.toHex());
-          unsub();
-        }
+      return await new Promise<string>(async (resolve, reject) => {
+        const unsub = await call.signAndSend(pair, (res: any) => {
+          if (res.status.isInBlock) {
+            const blockHash = res.status.asInBlock.toHex();
+            console.log('[htlc-relayer] X3 claim included in block', blockHash);
+            unsub();
+            resolve(blockHash);
+          } else if (res.status.isFinalized) {
+            const blockHash = res.status.asFinalized.toHex();
+            console.log('[htlc-relayer] X3 claim finalized in block', blockHash);
+            unsub();
+            resolve(blockHash);
+          }
+        }).catch((err: any) => reject(err));
       });
-      return true;
     } catch (err) {
       console.error('[htlc-relayer] submitX3vmClaim failed', err.message || err);
-      return false;
+      throw err;
     }
   }
 }
