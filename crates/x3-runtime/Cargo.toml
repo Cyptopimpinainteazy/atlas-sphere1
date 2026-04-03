@@ -27,6 +27,7 @@ wasmi = "0.31"
 [dev-dependencies]
 x3-compiler = { path = "../x3-compiler" }
 env_logger = "0.10"
+criterion = "0.4"
 
 [features]
 default = []

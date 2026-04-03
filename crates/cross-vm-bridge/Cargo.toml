@@ -16,10 +16,9 @@ sp-runtime = { workspace = true, default-features = false }
 sp-std = { workspace = true, default-features = false }
 
 # X3 Language integration for cross-chain smart contracts
-x3-vm = { path = "../../x3-lang/vm", default-features = false, optional = true }
-x3-common = { path = "../../x3-lang/crates/x3-common", default-features = false, optional = true }
-x3-ast = { path = "../../x3-lang/crates/x3-ast", default-features = false, optional = true }
-x3-tools = { path = "../../x3-lang/crates/x3-tools", default-features = false, optional = true }
+x3-vm = { path = "../x3-vm", default-features = false, optional = true }
+x3-common = { path = "../x3-common", default-features = false, optional = true }
+x3-ast = { path = "../x3-ast", default-features = false, optional = true }
 
 [features]
 default = ["std"]
@@ -36,7 +35,6 @@ x3-support = [
     "x3-vm",
     "x3-common",
     "x3-ast",
-    "x3-tools",
 ]
 
 [lib]

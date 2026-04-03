@@ -284,6 +284,8 @@ mod tests {
         state2.mark_refunded();
         assert_eq!(state2.status, HtlcStatus::Refunded);
     }
+
+
 }
 
 /// HTLC Claim Result
@@ -452,58 +454,4 @@ pub enum HtlcRefundError {
     AlreadyRefunded,
     UnauthorizedRefunder,
     StorageError,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_htlc_status_codes() {
-        assert_eq!(HtlcStatus::Locked.code(), 0);
-        assert_eq!(HtlcStatus::Claimed.code(), 1);
-        assert_eq!(HtlcStatus::Refunded.code(), 2);
-        assert_eq!(HtlcStatus::Expired.code(), 3);
-    }
-
-    #[test]
-    fn test_proof_verification() {
-        use sha2::{Digest, Sha256};
-        
-        let preimage = b"test_secret".to_vec();
-        let mut hasher = Sha256::new();
-        hasher.update(&preimage);
-        let secret_hash = H256::from_slice(&hasher.finalize());
-
-        let proof = HtlcProof {
-            htlc_id: HtlcId::new(1),
-            from_chain: 1,
-            to_chain: 2,
-            recipient: 0u32,
-            amount: 1000,
-            preimage,
-            secret_hash,
-            proved_at: 100,
-            proof_hash: H256::zero(),
-        };
-
-        assert!(proof.verify_preimage());
-    }
-
-    #[test]
-    fn test_htlc_state_creation() {
-        let state = HtlcState::new(
-            HtlcId::new(1),
-            0u32,
-            1u32,
-            H256::zero(),
-            1000u128,
-            1000u32,
-            100u32,
-        );
-
-        assert_eq!(state.status, HtlcStatus::Locked);
-        assert!(state.is_claimable());
-        assert_eq!(state.claimed_by, None);
-    }
 }

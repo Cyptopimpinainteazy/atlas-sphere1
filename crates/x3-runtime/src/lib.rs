@@ -300,6 +300,8 @@ impl StdlibRegistry {
         modules.insert("core::safe_sub".to_string(), StdlibModule::Core);
         modules.insert("core::safe_mul".to_string(), StdlibModule::Core);
         modules.insert("core::safe_div".to_string(), StdlibModule::Core);
+        // Crypto helpers
+        modules.insert("core::sha256".to_string(), StdlibModule::Core);
         
         // BRIDGE module functions (cross-chain messaging)
         modules.insert("bridge::host_send_message".to_string(), StdlibModule::Bridge);
@@ -390,6 +392,15 @@ fn dispatch_core(name: &str, args: &[u8], ctx: &mut X3Context) -> Result<Vec<u8>
             }
             ctx.consume_gas(20)?;
             Ok(vec![])
+        },
+        "core::sha256" => {
+            // Compute SHA-256 digest of input bytes and return 32-byte digest
+            use sha2::{Sha256, Digest};
+            ctx.consume_gas(100 + args.len() as u64)?; // base + per-byte
+            let mut hasher = Sha256::new();
+            hasher.update(args);
+            let digest = hasher.finalize();
+            Ok(digest.to_vec())
         },
         _ => Err(anyhow!("Unknown core function: {}", name)),
     }
@@ -604,5 +615,23 @@ mod tests {
         
         assert!(!params.evm_payload.is_empty());
         assert_eq!(params.nonce, 1);
+    }
+
+    #[test]
+    fn test_core_sha256() {
+        let registry = StdlibRegistry::new();
+        let caller = [1u8; 32];
+        let mut ctx = X3Context::new(caller, 10000);
+
+        // Compute sha256("test_secret") using stdlib
+        let input = b"test_secret";
+        let out = registry.dispatch("core::sha256", input, &mut ctx).unwrap();
+        // Expected: compute locally
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(input);
+        let expected = hasher.finalize();
+        assert_eq!(out.len(), 32);
+        assert_eq!(out, expected.to_vec());
     }
 }

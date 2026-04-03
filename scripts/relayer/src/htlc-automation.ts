@@ -5,8 +5,9 @@ import path from 'path';
 // Configuration
 const EVM_RPC = process.env.EVM_RPC_URL || 'http://localhost:8545';
 const EVM_DEPLOYER_PK = process.env.EVM_DEPLOYER_PRIVATE_KEY || '';
-const EVM_HTLC_ARTIFACT = path.join(__dirname, '../../apps/blockchain-adapter/deployed_htlc.json');
+const EVM_HTLC_ARTIFACT = path.join(__dirname, '..', '..', '..', 'apps', 'blockchain-adapter', 'deployed_htlc.json');
 const EVM_CONFIRMS = parseInt(process.env.EVM_CONFIRMS || '3', 10);
+const EVM_CONFIRM_TIMEOUT_MS = parseInt(process.env.EVM_CONFIRM_TIMEOUT_MS || '120000', 10); // ms
 const X3_SIGNER_SURI = process.env.X3VM_SIGNER_SURI || '';
 const X3_PALLET = process.env.X3HTLC_PALLET || 'x3Htlc';
 const X3_METHOD = process.env.X3HTLC_METHOD || 'claim';
@@ -16,12 +17,12 @@ const SAFETY_DELTA_BLOCKS = parseInt(process.env.SAFETY_DELTA_BLOCKS || '20', 10
 const SECONDS_PER_BLOCK = parseInt(process.env.SECONDS_PER_BLOCK || '12', 10);
 const SAFETY_DELTA_SECONDS = SAFETY_DELTA_BLOCKS * SECONDS_PER_BLOCK; // seconds to reserve before timelock expiry
 
+let evmDeployed: any = { abi: [], address: '' };
 if (!fs.existsSync(EVM_HTLC_ARTIFACT)) {
-  console.error('[htlc-automation] deployed_htlc.json not found. Deploy HTLC first.');
-  process.exit(1);
+  console.warn('[htlc-automation] deployed_htlc.json not found. Proceeding in test/mock mode.');
+} else {
+  evmDeployed = JSON.parse(fs.readFileSync(EVM_HTLC_ARTIFACT, 'utf8'));
 }
-
-const evmDeployed = JSON.parse(fs.readFileSync(EVM_HTLC_ARTIFACT, 'utf8'));
 
 async function sleep(ms:number){ return new Promise(r=>setTimeout(r, ms)); }
 
@@ -58,7 +59,7 @@ export class HtlcAutomator {
         const finalized = await this.waitX3Finality(x3BlockHash);
         if (finalized) console.log('[htlc-automator] X3VM claim finalized');
         else console.warn('[htlc-automator] X3VM claim not finalized within timeout');
-      } catch (err) {
+      } catch (err: any) {
         console.error('[htlc-automator] failed to forward to X3VM', err.message || err);
       }
     });
@@ -81,7 +82,7 @@ export class HtlcAutomator {
             return;
           }
         }
-      } catch (err) {
+      } catch (err: any) {
         console.warn('[htlc-automator] failed to verify EVM lock timelock, proceeding cautiously', err.message || err);
       }
 
@@ -92,7 +93,7 @@ export class HtlcAutomator {
         // wait confirmations
         const confirmed = await this.waitEvmConfirmations(txhash);
         if (!confirmed) console.warn('[htlc-automator] EVM claim not fully confirmed after submit');
-      } catch (err) {
+      } catch (err: any) {
         console.error('[htlc-automator] failed to submit claim to EVM', err.message || err);
       }
     });
@@ -104,7 +105,7 @@ export class HtlcAutomator {
   }
 
   // Wait until an EVM tx has the required number of confirmations
-  async waitEvmConfirmations(txHash: string, requiredConfirms = EVM_CONFIRMS, timeoutMs = 120000): Promise<boolean> {
+  async waitEvmConfirmations(txHash: string, requiredConfirms = EVM_CONFIRMS, timeoutMs = EVM_CONFIRM_TIMEOUT_MS): Promise<boolean> {
     if (!txHash) return false;
     const start = Date.now();
     const provider = (this.relayer as any).evmProvider;
@@ -116,12 +117,15 @@ export class HtlcAutomator {
           const confirms = current - receipt.blockNumber + 1; // include the block
           if (confirms >= requiredConfirms) return true;
           console.log('[htlc-automator] tx', txHash, 'confirms', confirms, 'waiting for', requiredConfirms);
+        } else {
+          console.log('[htlc-automator] waiting for tx receipt', txHash);
         }
-      } catch (err) {
+      } catch (err: any) {
         console.error('[htlc-automator] error while checking tx receipt', err.message || err);
       }
       await sleep(3000);
     }
+    console.warn('[htlc-automator] waitEvmConfirmations timeout for', txHash, 'after', timeoutMs, 'ms');
     return false;
   }
 
@@ -140,7 +144,7 @@ export class HtlcAutomator {
         const depth = finalizedNum - blkNum;
         console.log('[htlc-automator] X3 block', blockHash, 'depth', depth, 'required', requiredDepth);
         if (depth >= requiredDepth) return true;
-      } catch (err) {
+      } catch (err: any) {
         console.warn('[htlc-automator] waitX3Finality check failed', err.message || err);
       }
       await sleep(3000);
@@ -153,7 +157,7 @@ export class HtlcAutomator {
       try {
         // TODO: query pending swaps, check timeouts, attempt refunds or alerts
         await sleep(30000);
-      } catch (err) {
+      } catch (err: any) {
         console.error('[htlc-automator] reconciler error', err.message || err);
       }
     }

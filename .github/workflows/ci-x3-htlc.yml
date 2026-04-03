@@ -1,0 +1,53 @@
+name: CI - x3-htlc
+
+on:
+  push:
+    paths:
+      - 'crates/x3-htlc/**'
+      - 'crates/x3-runtime/**'
+      - '.github/workflows/ci-x3-htlc.yml'
+  pull_request:
+    paths:
+      - 'crates/x3-htlc/**'
+      - 'crates/x3-runtime/**'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    outputs:
+      tests_outcome: ${{ steps.test.outcome }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+      - name: Run x3-htlc tests
+        id: test
+        run: |
+          cargo test -p x3-htlc --all-features --no-fail-fast
+
+  bench:
+    needs: test
+    runs-on: ubuntu-latest
+    if: needs.test.result == 'success'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+      - name: Run benches
+        run: |
+          # Run criterion benches without generating plots to keep runtime reasonable
+          cargo bench -p x3-runtime -- --noplot
+      - name: Upload bench results
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-results
+          path: target/criterion
+

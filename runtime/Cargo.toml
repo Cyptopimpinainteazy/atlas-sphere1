@@ -70,7 +70,7 @@ atlas-cross-vm-bridge = { path = "../crates/cross-vm-bridge", default-features =
 # std-only VM integration crates are only available to NATIVE builds.
 atlas-evm-integration = { path = "../crates/evm-integration", default-features = false, optional = true }
 atlas-svm-integration = { path = "../crates/svm-integration", default-features = false, optional = true }
-x3-vm = { path = "../x3-lang/vm", optional = true }
+x3-vm = { path = "../crates/x3-vm", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # Force a wasm-compatible getrandom implementation for runtime WASM builds.

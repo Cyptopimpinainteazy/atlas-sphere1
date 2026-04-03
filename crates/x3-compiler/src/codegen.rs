@@ -309,6 +309,7 @@ impl Codegen {
             ("env".to_string(), "self_address".to_string(), 2),
             ("env".to_string(), "get_storage".to_string(), 1),
             ("env".to_string(), "set_storage".to_string(), 1),
+            ("env".to_string(), "host_sha256".to_string(), 6),
         ];
 
         Codegen {
